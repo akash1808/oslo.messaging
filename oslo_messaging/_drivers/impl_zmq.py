@@ -37,7 +37,7 @@ from oslo_messaging._drivers import base
 from oslo_messaging._drivers import common as rpc_common
 from oslo_messaging._executors import base as executor_base  # FIXME(markmc)
 from oslo_messaging._i18n import _, _LE, _LW
-
+from oslo_messaging._drivers import pool
 
 zmq = importutils.try_import('eventlet.green.zmq')
 
@@ -117,8 +117,8 @@ class ZmqSocket(object):
     Can be used as a Context (supports the 'with' statement).
     """
 
-    def __init__(self, addr, zmq_type, bind=True, subscribe=None):
-        self.ctxt = zmq.Context(CONF.rpc_zmq_contexts)
+    def __init__(self, addr, zmq_type, bind=True, subscribe=None, ctxt=None):
+        self.ctxt = ctxt or zmq.Context(CONF.rpc_zmq_contexts)
         self.sock = self.ctxt.socket(zmq_type)
 
         # Enable IPv6-support in libzmq.
@@ -225,19 +225,24 @@ class ZmqSocket(object):
     def recv(self, **kwargs):
         if not self.can_recv:
             raise RPCException(_("You cannot recv on this socket."))
-        return self.sock.recv_multipart(**kwargs)
+        data = self.sock.recv_multipart(**kwargs)
+        LOG.info("\n\n+++++++++++ Received socket type %s\n\n", self.socket_s())
+        LOG.info("\n\n+++++++++++ Received data %s\n\n", data[3])
+        return data
 
     def send(self, data, **kwargs):
         if not self.can_send:
             raise RPCException(_("You cannot send on this socket."))
         self.sock.send_multipart(data, **kwargs)
-
+        LOG.info("\n\n+++++++++++ Sending socket type %s\n\n", self.socket_s())
+        LOG.info("\n\n+++++++++++ Sending data %s %s\n\n", data[1], data[3])
 
 class ZmqClient(object):
     """Client for ZMQ sockets."""
 
-    def __init__(self, addr):
-        self.outq = ZmqSocket(addr, zmq.PUSH, bind=False)
+    def __init__(self, addr, ctxt=None):
+        self.address = addr
+        self.outq = ZmqSocket(addr, zmq.PUSH, bind=False, ctxt=ctxt)
 
     def cast(self, msg_id, topic, data, envelope):
         msg_id = msg_id or 0
@@ -257,6 +262,67 @@ class ZmqClient(object):
 
     def close(self):
         self.outq.close()
+
+
+class ZmqClientContext(object):
+    """This is essentially a wrapper around ZmqClient that supports 'with'.
+    It can also return a new ZmqClient, or one from a pool.
+
+    The function will also catch when an instance of this class is to be
+    deleted.  With that we can return ZmqClients to the pool on exceptions
+    and so forth without making the caller be responsible for catching them.
+    If possible the function makes sure to return a client to the pool.
+
+    Based on amqp.ConnectionContext.
+    """
+
+    def __init__(self, address, connection_pool=None, pooled=False):
+        self.connection = None
+        self.connection_pool = connection_pool
+        self.pooled = pooled
+        if self.pooled and self.connection_pool is not None:
+            self.connection = self.connection_pool.get(address)
+        else:
+            self.connection = ZmqClient(address)
+
+    def __enter__(self):
+        """When with ZmqClientContext() is used, return self."""
+        return self
+
+    def _done(self):
+        """If the client came from a pool, clean it up and put it back.
+        If it did not come from a pool, close it.
+        """
+        if self.connection:
+            if self.pooled and self.connection_pool is not None:
+                # Reset the connection so it's ready for the next caller
+                # to grab from the pool
+                self.connection_pool.put(self.connection)
+            else:
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+            self.connection = None
+
+    def __exit__(self, exc_type, exc_value, tb):
+        """End of 'with' statement.  We're done here."""
+        self._done()
+
+    def __del__(self):
+        """Caller is done with this client.  Make sure we cleaned up."""
+        self._done()
+
+    def close(self):
+        """Caller is done with this client."""
+        self._done()
+
+    def __getattr__(self, key):
+        """Proxy all other calls to the ZmqClient instance."""
+        if self.connection:
+            return getattr(self.connection, key)
+        else:
+            raise rpc_common.InvalidRPCConnectionReuse()
 
 
 class RpcContext(rpc_common.CommonRpcContext):
@@ -320,7 +386,7 @@ class InternalContext(object):
             return {'exc':
                     rpc_common.serialize_remote_exception(sys.exc_info())}
 
-    def reply(self, ctx, proxy,
+    def reply(self, driver, ctx, proxy,
               msg_id=None, context=None, topic=None, msg=None):
         """Reply to a casted call."""
         # NOTE(ewindisch): context kwarg exists for Grizzly compat.
@@ -335,20 +401,21 @@ class InternalContext(object):
             self._get_response(ctx, proxy, topic, payload),
             ctx.replies)
 
-        LOG.debug("Sending reply")
-        _multi_send(_cast, ctx, topic, {
+        LOG.info("Sending reply")
+        _multi_send(driver, _cast, ctx, topic, {
             'method': '-process_reply',
             'args': {
                 'msg_id': msg_id,  # Include for Folsom compat.
                 'response': response
             }
-        }, _msg_id=msg_id)
+        }, _msg_id=msg_id, pooled=True)
 
 
 class ConsumerBase(object):
     """Base Consumer."""
 
-    def __init__(self):
+    def __init__(self, driver):
+        self.driver = driver
         self.private_ctx = InternalContext(None)
 
     @classmethod
@@ -368,10 +435,12 @@ class ConsumerBase(object):
         # Method starting with - are
         # processed internally. (non-valid method name)
         method = data.get('method')
+        LOG.debug("Value of method:%s: ", method)
+
         # Internal method
         # uses internal context for safety.
         if method == '-reply':
-            self.private_ctx.reply(ctx, proxy, **data['args'])
+            self.private_ctx.reply(self.driver, ctx, proxy, **data['args'])
             return
 
         proxy.dispatch(ctx, data)
@@ -383,9 +452,10 @@ class ZmqBaseReactor(ConsumerBase):
     Used for RoundRobin requests.
     """
 
-    def __init__(self, conf):
-        super(ZmqBaseReactor, self).__init__()
+    def __init__(self, conf, driver=None):
+        super(ZmqBaseReactor, self).__init__(driver)
 
+        self.driver = driver
         self.proxies = {}
         self.threads = []
         self.sockets = []
@@ -412,7 +482,7 @@ class ZmqBaseReactor(ConsumerBase):
 
     def consume_in_thread(self):
         def _consume(sock):
-            LOG.info(_("Consuming socket"))
+            LOG.info(_("Consuming socket hahaha"))
             while not sock.closed:
                 self.consume(sock)
 
@@ -450,6 +520,7 @@ class ZmqProxy(ZmqBaseReactor):
         ipc_dir = CONF.rpc_zmq_ipc_dir
 
         data = sock.recv(copy=False)
+        LOG.info("\n\n+++++++++++++++asm: %s %s %s\n\n", data[1], data[2], data[3])
         topic = data[1].bytes
         if six.PY3:
             topic = topic.decode('utf-8')
@@ -460,9 +531,11 @@ class ZmqProxy(ZmqBaseReactor):
         elif topic.startswith('zmq_replies'):
             sock_type = zmq.PUB
         else:
+            LOG.info(_("value of topic_proxy ++anant"))
             sock_type = zmq.PUSH
-
+        LOG.info(_("value of topic_proxy ++akash: %s %s"), self.topic_proxy,topic)
         if topic not in self.topic_proxy:
+            LOG.info(_("value of topic_proxy ++akash: %s %s"), self.topic_proxy,topic)
             def publisher(waiter):
                 LOG.info(_("Creating proxy for topic: %s"), topic)
 
@@ -474,9 +547,10 @@ class ZmqProxy(ZmqBaseReactor):
                         LOG.warn(emsg)
                         raise RPCException(emsg)
 
-                    out_sock = ZmqSocket("ipc://%s/zmq_topic_%s" %
-                                         (ipc_dir, topic),
-                                         sock_type, bind=True)
+                    #out_sock = ZmqSocket("ipc://%s/zmq_topic_%s" %
+                    #                     (ipc_dir, topic),
+                    #                     sock_type, bind=True)
+                    out_sock = ZmqSocket("tcp://127.0.0.1:9000",sock_type, bind=True)
                 except RPCException:
                     waiter.send_exception(*sys.exc_info())
                     return
@@ -494,21 +568,23 @@ class ZmqProxy(ZmqBaseReactor):
 
                 while(True):
                     data = self.topic_proxy[topic].get()
+                    LOG.debug("Preparation to send halalua. %s" , data[3])
                     out_sock.send(data, copy=False)
+                    LOG.debug("Message sent YAY!!!")
 
             wait_sock_creation = eventlet.event.Event()
             eventlet.spawn(publisher, wait_sock_creation)
-
+            LOG.debug("Preparation to send merry christmas. %s" , data[3])
             try:
                 wait_sock_creation.wait()
             except RPCException:
-                LOG.error(_("Topic socket file creation failed."))
+                LOG.debug(_("Topic socket file creation failed."))
                 return
 
         try:
             self.topic_proxy[topic].put_nowait(data)
         except eventlet.queue.Full:
-            LOG.error(_("Local per-topic backlog buffer full for topic "
+            LOG.debug(_("Local per-topic backlog buffer full for topic "
                         "%s. Dropping message."), topic)
 
     def consume_in_thread(self):
@@ -564,13 +640,13 @@ class ZmqReactor(ZmqBaseReactor):
     Can also be used as a 1:1 proxy
     """
 
-    def __init__(self, conf):
-        super(ZmqReactor, self).__init__(conf)
+    def __init__(self, conf, driver):
+        super(ZmqReactor, self).__init__(conf, driver)
 
     def consume(self, sock):
         # TODO(ewindisch): use zero-copy (i.e. references, not copying)
         data = sock.recv()
-        LOG.debug("CONSUMER RECEIVED DATA: %s", data)
+        LOG.info("CONSUMER RECEIVED DATA: %s", data)
 
         proxy = self.proxies[sock]
 
@@ -598,14 +674,14 @@ class ZmqReactor(ZmqBaseReactor):
 class Connection(rpc_common.Connection):
     """Manages connections and threads."""
 
-    def __init__(self, conf):
+    def __init__(self, conf, driver):
         self.topics = []
-        self.reactor = ZmqReactor(conf)
+        self.reactor = ZmqReactor(conf, driver)
 
     def create_consumer(self, topic, proxy, fanout=False):
         # Register with matchmaker.
         _get_matchmaker().register(topic, CONF.rpc_zmq_host)
-
+        LOG.info("\n\n+++++++++++ Topics created are %s \n\n", topic)
         # Subscription scenarios
         if fanout:
             sock_type = zmq.SUB
@@ -621,10 +697,10 @@ class Connection(rpc_common.Connection):
             return
 
         # Receive messages from (local) proxy
-        inaddr = "ipc://%s/zmq_topic_%s" % \
-            (CONF.rpc_zmq_ipc_dir, topic)
-
-        LOG.debug("Consumer is a zmq.%s",
+#        inaddr = "ipc://%s/zmq_topic_%s" % \
+#            (CONF.rpc_zmq_ipc_dir, topic)
+        inaddr = "tcp://127.0.0.1:9000"
+        LOG.info("Consumer is a zmq.%s",
                   ['PULL', 'SUB'][sock_type == zmq.SUB])
 
         self.reactor.register(proxy, inaddr, sock_type,
@@ -653,8 +729,8 @@ class Connection(rpc_common.Connection):
         self.reactor.consume_in_thread()
 
 
-def _cast(addr, context, topic, msg, timeout=None, envelope=False,
-          _msg_id=None, allowed_remote_exmods=None):
+def _cast(driver, addr, context, topic, msg, timeout=None, envelope=False,
+          _msg_id=None, allowed_remote_exmods=None, pooled=False):
     allowed_remote_exmods = allowed_remote_exmods or []
     timeout_cast = timeout or CONF.rpc_cast_timeout
     payload = [RpcContext.marshal(context), msg]
@@ -662,21 +738,16 @@ def _cast(addr, context, topic, msg, timeout=None, envelope=False,
         topic = topic.encode('utf-8')
 
     with Timeout(timeout_cast, exception=rpc_common.Timeout):
-        conn = None
-        try:
-            conn = ZmqClient(addr)
-
-            # assumes cast can't return an exception
-            conn.cast(_msg_id, topic, payload, envelope)
-        except zmq.ZMQError:
-            raise RPCException("Cast failed. ZMQ Socket Exception")
-        finally:
-            if conn is not None:
-                conn.close()
+        with driver.get_connection(addr, pooled) as conn:
+            try:
+                # assumes cast can't return an exception
+                conn.cast(_msg_id, topic, payload, envelope)
+            except zmq.ZMQError:
+                raise RPCException("Cast failed. ZMQ Socket Exception")
 
 
-def _call(addr, context, topic, msg, timeout=None,
-          envelope=False, allowed_remote_exmods=None):
+def _call(driver, addr, context, topic, msg, timeout=None,
+          envelope=False, allowed_remote_exmods=None, pooled=False):
     allowed_remote_exmods = allowed_remote_exmods or []
     # timeout_response is how long we wait for a response
     timeout = timeout or CONF.rpc_response_timeout
@@ -687,7 +758,7 @@ def _call(addr, context, topic, msg, timeout=None,
     # Replies always come into the reply service.
     reply_topic = "zmq_replies.%s" % CONF.rpc_zmq_host
 
-    LOG.debug("Creating payload")
+    LOG.info("Creating payload")
     # Curry the original request into a reply method.
     mcontext = RpcContext.marshal(context)
     payload = {
@@ -700,21 +771,25 @@ def _call(addr, context, topic, msg, timeout=None,
         }
     }
 
-    LOG.debug("Creating queue socket for reply waiter")
+    LOG.info("Creating queue socket for reply waiter")
 
     # Messages arriving async.
     # TODO(ewindisch): have reply consumer with dynamic subscription mgmt
     with Timeout(timeout, exception=rpc_common.Timeout):
         try:
+            #msg_waiter = ZmqSocket(
+            #    "ipc://%s/zmq_topic_zmq_replies.%s" %
+            #    (CONF.rpc_zmq_ipc_dir,
+            #     CONF.rpc_zmq_host),
+            #    zmq.SUB, subscribe=msg_id, bind=False
+            #)
             msg_waiter = ZmqSocket(
-                "ipc://%s/zmq_topic_zmq_replies.%s" %
-                (CONF.rpc_zmq_ipc_dir,
-                 CONF.rpc_zmq_host),
-                zmq.SUB, subscribe=msg_id, bind=False
+                "tcp://127.0.0.1:9000",zmq.SUB, subscribe=msg_id, bind=False
             )
 
             LOG.debug("Sending cast: %s", topic)
-            _cast(addr, context, topic, payload, envelope=envelope)
+            _cast(driver, addr, context, topic, payload, envelope=envelope,
+                  pooled=pooled)
 
             LOG.debug("Cast sent; Waiting reply")
             # Blocks until receives reply
@@ -755,8 +830,9 @@ def _call(addr, context, topic, msg, timeout=None,
     return responses[-1]
 
 
-def _multi_send(method, context, topic, msg, timeout=None,
-                envelope=False, _msg_id=None, allowed_remote_exmods=None):
+def _multi_send(driver, method, context, topic, msg, timeout=None,
+                envelope=False, _msg_id=None, allowed_remote_exmods=None,
+                pooled=False):
     """Wraps the sending of messages.
 
     Dispatches to the matchmaker and sends message to all relevant hosts.
@@ -766,7 +842,7 @@ def _multi_send(method, context, topic, msg, timeout=None,
     LOG.debug(' '.join(map(pformat, (topic, msg))))
 
     queues = _get_matchmaker().queues(topic)
-    LOG.debug("Sending message(s) to: %s", queues)
+    LOG.info("Sending message(s) to: %s", queues)
 
     # Don't stack if we have no matchmaker results
     if not queues:
@@ -787,11 +863,12 @@ def _multi_send(method, context, topic, msg, timeout=None,
         _addr = "tcp://%s:%s" % (ip_addr, conf.rpc_zmq_port)
 
         if method.__name__ == '_cast':
-            eventlet.spawn_n(method, _addr, context,
-                             _topic, msg, timeout, envelope, _msg_id)
+            eventlet.spawn_n(method, driver, _addr, context,
+                             _topic, msg, timeout, envelope, _msg_id,
+                             None, pooled)
         else:
-            return_val = method(_addr, context, _topic, msg, timeout,
-                                envelope, allowed_remote_exmods)
+            return_val = method(driver, _addr, context, _topic, msg, timeout,
+                                envelope, allowed_remote_exmods, pooled)
 
     return return_val
 
@@ -809,7 +886,7 @@ def _get_matchmaker(*args, **kwargs):
         'oslo.messaging._drivers.matchmaker_ring.MatchMakerRing': 'ring',
         'oslo.messaging._drivers.matchmaker.MatchMakerLocalhost': 'local'}
     if mm_name in mm_mapping:
-        LOG.warn(_LW('rpc_zmq_matchmaker = %(old_val)s is deprecated. '
+        LOG.debug(_LW('rpc_zmq_matchmaker = %(old_val)s is deprecated. '
                      'It is suggested to change the value to %(new_val)s.'),
                  {'old_val': mm_name, 'new_val': mm_mapping[mm_name]})
         mm_name = mm_mapping[mm_name]
@@ -871,6 +948,50 @@ class ZmqListener(base.Listener):
             return None
 
 
+class ZmqClientPool(pool.Pool):
+    """Class that implements a pool of Zmq Clients for a single endpoint"""
+    def __init__(self, conf, address, connection_cls, ctxt):
+        self.connection_cls = connection_cls
+        self.ctxt = ctxt
+        self.address = address
+        super(ZmqClientPool, self).__init__(conf.rpc_conn_pool_size)
+
+    def create(self):
+        LOG.debug('Pool creating new ZMQ connection for %s' % self.address)
+        return self.connection_cls(self.address, self.ctxt)
+
+    def empty(self):
+        for item in self.iter_free():
+            item.close()
+
+
+class ZmqClientPoolManager(object):
+    """Class that manages pools of clients for Zmq endpoints"""
+
+    def __init__(self, conf, ctxt=None):
+        self._pools = {}
+        self._lock = threading.Lock()
+        self.conf = conf
+        self.ctxt = ctxt
+
+    def get(self, address):
+        if address not in self._pools:
+            with self._lock:
+                if address not in self._pools:
+                    self._pools[address] = ZmqClientPool(self.conf,
+                                                         address,
+                                                         ZmqClient,
+                                                         self.ctxt)
+        return self._pools[address].get()
+
+    def put(self, item):
+        self._pools[item.address].put(item)
+
+    def empty(self):
+        for p in self._pools:
+            self._pools[p].empty()
+
+
 class ZmqDriver(base.BaseDriver):
 
     # FIXME(markmc): allow this driver to be used without eventlet
@@ -881,6 +1002,7 @@ class ZmqDriver(base.BaseDriver):
             raise ImportError("Failed to import eventlet.green.zmq")
         conf.register_opts(zmq_opts)
         conf.register_opts(executor_base._pool_opts)
+        conf.register_opts(base.base_opts)
 
         super(ZmqDriver, self).__init__(conf, url, default_exchange,
                                         allowed_remote_exmods)
@@ -899,6 +1021,33 @@ class ZmqDriver(base.BaseDriver):
 
         self.listeners = []
 
+        # NOTE(jamespage): Create pool manager on first use to deal with
+        #                  os.fork calls in openstack daemons.
+        self._pool = None
+        self._pid = None
+        self._lock = threading.Lock()
+
+    def _configure_pool_manager(func):
+        """Causes a new pool manager to be created when the messaging service is
+        first used by the current process.  This is important as all connections
+        in the pools manager by the pool manager will share the same ZMQ context,
+        which must not be shared across OS processes.
+        """
+        def wrap(self, *args, **kws):
+            with self._lock:
+                old_pid = self._pid
+                self._pid = os.getpid()
+
+            if old_pid != self._pid:
+                # Create fresh pool manager for the current process
+                # along with a new ZMQ context.
+                self._pool = ZmqClientPoolManager(
+                    self.conf,
+                    zmq.Context(self.conf.rpc_zmq_contexts)
+                )
+            return func(self, *args, **kws)
+        return wrap
+
     def _send(self, target, ctxt, message,
               wait_for_reply=None, timeout=None, envelope=False):
 
@@ -915,19 +1064,22 @@ class ZmqDriver(base.BaseDriver):
         elif target.server:
             topic = '%s.%s' % (topic, target.server)
 
-        reply = _multi_send(method, ctxt, topic, message,
+        reply = _multi_send(self, method, ctxt, topic, message,
                             envelope=envelope,
-                            allowed_remote_exmods=self._allowed_remote_exmods)
+                            allowed_remote_exmods=self._allowed_remote_exmods,
+                            pooled=True)
 
         if wait_for_reply:
             return reply[-1]
 
+    @_configure_pool_manager
     def send(self, target, ctxt, message, wait_for_reply=None, timeout=None,
              retry=None):
         # NOTE(sileht): retry is not implemented because this driver never
         # retry anything
         return self._send(target, ctxt, message, wait_for_reply, timeout)
 
+    @_configure_pool_manager
     def send_notification(self, target, ctxt, message, version, retry=None):
         # NOTE(ewindisch): dot-priority in rpc notifier does not
         # work with our assumptions.
@@ -936,8 +1088,9 @@ class ZmqDriver(base.BaseDriver):
         target = target(topic=target.topic.replace('.', '-'))
         return self._send(target, ctxt, message, envelope=(version == 2.0))
 
+    @_configure_pool_manager
     def listen(self, target):
-        conn = Connection(self.conf)
+        conn = Connection(self.conf, self)
 
         listener = ZmqListener(self)
 
@@ -951,12 +1104,13 @@ class ZmqDriver(base.BaseDriver):
 
         return listener
 
+    @_configure_pool_manager
     def listen_for_notifications(self, targets_and_priorities, pool):
         # NOTE(sileht): this listener implementation is limited
         # because zeromq doesn't support:
         #  * requeing message
         #  * pool
-        conn = Connection(self.conf)
+        conn = Connection(self.conf, self)
 
         listener = ZmqListener(self)
         for target, priority in targets_and_priorities:
@@ -974,3 +1128,8 @@ class ZmqDriver(base.BaseDriver):
         for c in self.listeners:
             c.close()
         self.listeners = []
+        if self._pool:
+            self._pool.empty()
+
+    def get_connection(self, address, pooled=False):
+        return ZmqClientContext(address, self._pool, pooled)
